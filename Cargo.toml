@@ -8,4 +8,6 @@ name = "mini_tokio"
 path = "src/lib.rs"
 
 [dependencies]
+crossbeam = "0.8.2"
 futures = "0.3.29"
+num_cpus = "1.16.0"

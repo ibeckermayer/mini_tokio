@@ -1,7 +1,7 @@
+use crossbeam::channel;
 use futures::task::{self, ArcWake};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Waker;
@@ -25,9 +25,15 @@ impl Future for Delay {
     type Output = &'static str;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<&'static str> {
-        // First, if this is the first time the future is called, spawn the
-        // timer thread. If the timer thread is already running, ensure the
-        // stored `Waker` matches the current task's waker.
+        // Check the current instant. If the duration has elapsed, then
+        // this future has completed so we return `Poll::Ready`.
+        if Instant::now() >= self.when {
+            return Poll::Ready("done");
+        }
+
+        // The duration has not elapsed. If this is the first time the future
+        // is called, spawn the timer thread. If the timer thread is already
+        // running, ensure thestored `Waker` matches the current task's waker.
         if let Some(waker) = &self.waker {
             let mut waker = waker.lock().unwrap();
 
@@ -59,28 +65,22 @@ impl Future for Delay {
             });
         }
 
-        // Once the waker is stored and the timer thread is started, it is
-        // time to check if the delay has completed. This is done by
-        // checking the current instant. If the duration has elapsed, then
-        // the future has completed and `Poll::Ready` is returned.
-        if Instant::now() >= self.when {
-            Poll::Ready("done")
-        } else {
-            // The duration has not elapsed, the future has not completed so
-            // return `Poll::Pending`.
-            //
-            // The `Future` trait contract requires that when `Pending` is
-            // returned, the future ensures that the given waker is signalled
-            // once the future should be polled again. In our case, by
-            // returning `Pending` here, we are promising that we will
-            // invoke the given waker included in the `Context` argument
-            // once the requested duration has elapsed. We ensure this by
-            // spawning the timer thread above.
-            //
-            // If we forget to invoke the waker, the task will hang
-            // indefinitely.
-            Poll::Pending
-        }
+        // By now, the waker is stored and the timer thread is started.
+        // The duration has not elapsed (recall that we checked for this
+        // first thing), ergo the future has not completed so we must
+        // return `Poll::Pending`.
+        //
+        // The `Future` trait contract requires that when `Pending` is
+        // returned, the future ensures that the given waker is signalled
+        // once the future should be polled again. In our case, by
+        // returning `Pending` here, we are promising that we will
+        // invoke the given waker included in the `Context` argument
+        // once the requested duration has elapsed. We ensure this by
+        // spawning the timer thread above.
+        //
+        // If we forget to invoke the waker, the task will hang
+        // indefinitely.
+        Poll::Pending
     }
 }
 
@@ -92,7 +92,7 @@ struct Task {
     // more lines of code than can fit in a single tutorial
     // page.
     future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    executor: mpsc::Sender<Arc<Task>>,
+    executor: channel::Sender<Arc<Task>>,
 }
 
 impl ArcWake for Task {
@@ -116,12 +116,6 @@ impl Task {
         let mut future = self.future.try_lock().unwrap();
 
         // Poll the future
-        // Looking at our `Delay` future above, this is where
-        // `Delay::poll` gets called. Eventually it will cause
-        // a call to `waker.wake()`, which calls the `ArcWake`
-        // automatic `wake` impl, which calls the `wake_by_ref`
-        // above, which calls `schedule` above, which pushes
-        // `Task` back onto the executor queue.
         let _ = future.as_mut().poll(&mut cx);
     }
 
@@ -130,7 +124,7 @@ impl Task {
     // Initializes a new Task harness containing the given future and pushes it
     // onto `sender`. The receiver half of the channel will get the task and
     // execute it.
-    fn spawn<F>(future: F, sender: &mpsc::Sender<Arc<Task>>)
+    fn spawn<F>(future: F, sender: &channel::Sender<Arc<Task>>)
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -147,19 +141,34 @@ impl Task {
 }
 
 pub struct MiniTokio {
-    scheduled: mpsc::Receiver<Arc<Task>>,
-    sender: mpsc::Sender<Arc<Task>>,
+    scheduled: channel::Receiver<Arc<Task>>,
+    sender: channel::Sender<Arc<Task>>,
 }
 
 impl MiniTokio {
-    pub fn run(&self) {
-        while let Ok(task) = self.scheduled.recv() {
-            task.poll();
+    pub fn run(&self, num_threads: usize) {
+        let mut workers = vec![];
+
+        for _ in 0..num_threads {
+            let scheduled = self.scheduled.clone();
+            let worker = thread::spawn(move || {
+                while let Ok(task) = scheduled.recv() {
+                    task.poll();
+                }
+            });
+            workers.push(worker);
+        }
+
+        // Wait for all workers to finish
+        for worker in workers {
+            if let Err(e) = worker.join() {
+                println!("Error joining worker thread: {:?}", e);
+            }
         }
     }
 
     pub fn new() -> MiniTokio {
-        let (sender, scheduled) = mpsc::channel();
+        let (sender, scheduled) = channel::unbounded();
         MiniTokio { scheduled, sender }
     }
 
