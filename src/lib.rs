@@ -1,98 +1,49 @@
 use crossbeam::channel;
+use crossbeam::channel::Sender;
 use futures::task::{self, ArcWake};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::task::Waker;
 use std::task::{Context, Poll};
-use std::thread;
-use std::time::Instant;
 
-pub struct Delay {
-    when: Instant,
-    // This is Some when we have spawned a thread, and None otherwise.
-    waker: Option<Arc<Mutex<Waker>>>,
+pub mod time;
+
+/// A structure holding a future and the result of
+/// the latest call to its `poll` method.
+struct TaskFuture {
+    future: Pin<Box<dyn Future<Output = ()> + Send>>,
+    poll: Poll<()>,
 }
 
-impl Delay {
-    pub fn new(when: Instant) -> Delay {
-        Delay { when, waker: None }
+impl TaskFuture {
+    fn new(future: impl Future<Output = ()> + Send + 'static) -> TaskFuture {
+        TaskFuture {
+            future: Box::pin(future),
+            poll: Poll::Pending,
+        }
     }
-}
 
-impl Future for Delay {
-    type Output = &'static str;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<&'static str> {
-        // Check the current instant. If the duration has elapsed, then
-        // this future has completed so we return `Poll::Ready`.
-        if Instant::now() >= self.when {
-            return Poll::Ready("done");
+    fn poll(&mut self, cx: &mut Context<'_>) {
+        // Spurious wakeups are allowed, so we need to
+        // check that the future is still pending before
+        // calling `poll`. Failure to do so can lead to
+        // a panic.
+        if self.poll.is_pending() {
+            self.poll = self.future.as_mut().poll(cx);
         }
-
-        // The duration has not elapsed. If this is the first time the future
-        // is called, spawn the timer thread. If the timer thread is already
-        // running, ensure thestored `Waker` matches the current task's waker.
-        if let Some(waker) = &self.waker {
-            let mut waker = waker.lock().unwrap();
-
-            // Check if the stored waker matches the current task's waker.
-            // This is necessary as the `Delay` future instance may move to
-            // a different task between calls to `poll`. If this happens, the
-            // waker contained by the given `Context` will differ and we
-            // must update our stored waker to reflect this change.
-            if !waker.will_wake(cx.waker()) {
-                *waker = cx.waker().clone();
-            }
-        } else {
-            let when = self.when;
-            let waker = Arc::new(Mutex::new(cx.waker().clone()));
-            self.waker = Some(waker.clone());
-
-            // This is the first time `poll` is called, spawn the timer thread.
-            thread::spawn(move || {
-                let now = Instant::now();
-
-                if now < when {
-                    thread::sleep(when - now);
-                }
-
-                // The duration has elapsed. Notify the caller by invoking
-                // the waker.
-                let waker = waker.lock().unwrap();
-                waker.wake_by_ref();
-            });
-        }
-
-        // By now, the waker is stored and the timer thread is started.
-        // The duration has not elapsed (recall that we checked for this
-        // first thing), ergo the future has not completed so we must
-        // return `Poll::Pending`.
-        //
-        // The `Future` trait contract requires that when `Pending` is
-        // returned, the future ensures that the given waker is signalled
-        // once the future should be polled again. In our case, by
-        // returning `Pending` here, we are promising that we will
-        // invoke the given waker included in the `Context` argument
-        // once the requested duration has elapsed. We ensure this by
-        // spawning the timer thread above.
-        //
-        // If we forget to invoke the waker, the task will hang
-        // indefinitely.
-        Poll::Pending
     }
 }
 
 struct Task {
     // The `Mutex` is to make `Task` implement `Sync`. Only
-    // one thread accesses `future` at any given time. The
-    // `Mutex` is not required for correctness. Real Tokio
+    // one thread accesses `task_future` at any given time.
+    // The `Mutex` is not required for correctness. Real Tokio
     // does not use a mutex here, but real Tokio has
     // more lines of code than can fit in a single tutorial
     // page.
-    future: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    executor: channel::Sender<Arc<Task>>,
+    task_future: Mutex<TaskFuture>,
+    executor: Sender<Arc<Task>>,
 }
 
 impl ArcWake for Task {
@@ -112,11 +63,11 @@ impl Task {
         let waker = task::waker(self.clone());
         let mut cx = Context::from_waker(&waker);
 
-        // No other thread ever tries to lock the future
-        let mut future = self.future.try_lock().unwrap();
+        // No other thread ever tries to lock the task_future
+        let mut task_future = self.task_future.try_lock().unwrap();
 
-        // Poll the future
-        let _ = future.as_mut().poll(&mut cx);
+        // Poll the inner future
+        task_future.poll(&mut cx);
     }
 
     // Spawns a new task with the given future.
@@ -129,7 +80,7 @@ impl Task {
         F: Future<Output = ()> + Send + 'static,
     {
         let task = Arc::new(Task {
-            future: Mutex::new(Box::pin(future)),
+            task_future: Mutex::new(TaskFuture::new(future)),
             executor: sender.clone(),
         });
 
@@ -151,7 +102,7 @@ impl MiniTokio {
 
         for _ in 0..num_threads {
             let scheduled = self.scheduled.clone();
-            let worker = thread::spawn(move || {
+            let worker = std::thread::spawn(move || {
                 while let Ok(task) = scheduled.recv() {
                     task.poll();
                 }
