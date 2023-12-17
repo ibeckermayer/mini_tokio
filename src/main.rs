@@ -1,4 +1,4 @@
-use mini_tokio::{Delay, MiniTokio};
+use mini_tokio::{time::Delay, MiniTokio};
 use std::time::{Duration, Instant};
 
 fn main() {
