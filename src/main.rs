@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 fn main() {
     let mini_tokio = MiniTokio::new();
 
+    // let i = 1;
     for i in 0..50 {
         mini_tokio.spawn(async move {
             println!("delay {} started!", i);
@@ -18,4 +19,5 @@ fn main() {
 
     println!("Running mini_tokio...");
     mini_tokio.run(num_cpus::get());
+    println!("mini_tokio finished!");
 }
