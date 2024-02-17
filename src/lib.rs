@@ -2,6 +2,7 @@ use crossbeam::channel;
 use crossbeam::channel::Sender;
 use futures::task::{self, ArcWake};
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::atomic::AtomicPtr;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ where
     F: Future + Send + 'static,
 {
     future: Pin<Box<F>>,
+    /// The result of the most recent call to `self.future.poll()`
     poll: Poll<F::Output>,
 }
 
@@ -82,6 +84,10 @@ where
         }
     }
 
+    fn from_raw(ptr: AtomicPtr<Header>) -> Arc<Task<F>> {
+        unsafe { Arc::from_raw(ptr.into_inner() as *const Task<F>) }
+    }
+
     fn schedule(self: &Arc<Self>) {
         let _ = self.executor.send(self.into_raw());
     }
@@ -104,7 +110,7 @@ where
     // Initializes a new Task harness containing the given future and pushes it
     // onto `sender`. The receiver half of the channel will get the task and
     // execute it.
-    fn spawn(future: F, sender: &channel::Sender<RawTask>) {
+    fn spawn(future: F, sender: &channel::Sender<RawTask>) -> RawTask {
         let task = Arc::new(Task {
             _header: Header::new::<F>(),
             task_future: Mutex::new(TaskFuture::new(future)),
@@ -112,13 +118,17 @@ where
         });
 
         task.schedule();
+
+        task.into_raw()
     }
 }
 
 pub struct JoinHandle<T> {
-    _phantom: std::marker::PhantomData<T>,
+    _raw: RawTask,
+    _p: PhantomData<T>,
 }
 
+#[derive(Clone)]
 pub struct MiniTokio {
     scheduled: channel::Receiver<RawTask>,
     sender: channel::Sender<RawTask>,
@@ -132,7 +142,6 @@ impl MiniTokio {
             let scheduled = self.scheduled.clone();
             let worker = std::thread::spawn(move || {
                 while let Ok(raw_task) = scheduled.recv() {
-                    println!("Worker got a task!");
                     raw_task.poll();
                 }
             });
@@ -163,7 +172,7 @@ impl MiniTokio {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        Task::spawn(future, &self.sender);
+        let raw = Task::spawn(future, &self.sender);
 
         // The `JoinHandle` here is a placeholder for now.
         // This is simply a proof of concept that through
@@ -172,7 +181,8 @@ impl MiniTokio {
         // while still being able to spawn a `Task<F>` that
         // can be polled by the `MiniTokio` instance.
         JoinHandle {
-            _phantom: std::marker::PhantomData,
+            _raw: raw,
+            _p: PhantomData,
         }
     }
 }
@@ -258,6 +268,6 @@ where
     F::Output: Send + 'static,
 {
     // The pointer was created by `Arc::into_raw`, the task can (must) be re-created with `Arc::from_raw`.
-    let task = unsafe { Arc::from_raw(ptr.into_inner() as *const Task<F>) };
+    let task = Task::<F>::from_raw(ptr);
     task.poll();
 }
