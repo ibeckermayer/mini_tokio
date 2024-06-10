@@ -73,7 +73,7 @@ where
         }
     }
 
-    fn try_read_output(&mut self, dst: &mut Poll<JoinResult<F::Output>>, cx: &mut Context<'_>) {
+    fn try_read_output(&mut self, dst: &mut Poll<F::Output>, cx: &mut Context<'_>) {
         match self.state {
             TaskState::Pending(ref mut future) => {
                 // Safety: &mut self is mutually exclusive,
@@ -93,7 +93,7 @@ where
                 let poll = pinned.poll(cx);
                 match poll {
                     Poll::Ready(res) => {
-                        *dst = Poll::Ready(Ok(res));
+                        *dst = Poll::Ready(res);
                         self.state = TaskState::Consumed;
                     }
                     Poll::Pending => {
@@ -103,12 +103,12 @@ where
             }
             TaskState::Completed(_) => match mem::replace(&mut self.state, TaskState::Consumed) {
                 TaskState::Completed(res) => {
-                    *dst = Poll::Ready(Ok(res));
+                    *dst = Poll::Ready(res);
                 }
                 TaskState::Consumed | TaskState::Pending(_) => unreachable!(),
             },
             TaskState::Consumed => {
-                panic!("polled a consumed task");
+                panic!("tried to read output from a consumed task");
             }
         }
     }
@@ -147,11 +147,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    fn try_read_output(
-        self: &Arc<Self>,
-        dst: &mut Poll<JoinResult<F::Output>>,
-        cx: &mut Context<'_>,
-    ) {
+    fn try_read_output(self: &Arc<Self>, dst: &mut Poll<F::Output>, cx: &mut Context<'_>) {
         let mut task_future = self.task_future.lock().unwrap();
         task_future.try_read_output(dst, cx);
     }
@@ -248,7 +244,7 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    type Output = JoinResult<F::Output>;
+    type Output = F::Output;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut ret = Poll::Pending;
@@ -447,16 +443,12 @@ where
     task.poll();
 }
 
-#[derive(Debug)]
-pub struct JoinError(String);
-pub type JoinResult<T> = Result<T, JoinError>;
-
 unsafe fn try_read_output<F>(ptr: &AtomicPtr<Header>, dst: *mut (), cx: &mut Context<'_>) -> RawTask
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let out = &mut *(dst as *mut Poll<JoinResult<F::Output>>);
+    let out = &mut *(dst as *mut Poll<F::Output>);
     let task = Task::<F>::from_raw(ptr);
     task.try_read_output(out, cx);
     // Don't decrease the reference count on the task here,

@@ -10,7 +10,7 @@ fn main() {
         for i in 0..50 {
             let jh = mini_tokio_inner.spawn(async move {
                 println!("delay {} started!", i);
-                let when = Instant::now() + Duration::from_millis(100 * i);
+                let when = Instant::now() + Duration::from_millis(10 * i);
                 let future = Delay::new(when);
 
                 let out = future.await;
@@ -18,7 +18,7 @@ fn main() {
                 println!("delay {} completed; out = {:?}", i, out);
                 out
             });
-            let out = jh.await.unwrap();
+            let out = jh.await;
             println!("out after JoinHandle = {:?}", out);
         }
         mini_tokio_inner.run(num_cpus::get());
