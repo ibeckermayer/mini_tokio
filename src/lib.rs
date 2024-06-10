@@ -3,6 +3,7 @@ use crossbeam::channel::Sender;
 use futures::task::{self, ArcWake};
 use std::future::Future;
 use std::marker::PhantomData;
+use std::mem;
 use std::pin::Pin;
 use std::sync::atomic::AtomicPtr;
 use std::sync::Arc;
@@ -11,25 +12,34 @@ use std::task::{Context, Poll};
 
 pub mod time;
 
+enum TaskState<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    Pending(Box<F>),
+    Completed(F::Output),
+    Consumed,
+}
+
 /// A structure holding a future and the result of
 /// the latest call to its `poll` method.
 struct TaskFuture<F>
 where
     F: Future + Send + 'static,
+    F::Output: Send + 'static,
 {
-    future: Pin<Box<F>>,
-    /// The result of the most recent call to `self.future.poll()`
-    poll: Poll<F::Output>,
+    state: TaskState<F>,
 }
 
 impl<F> TaskFuture<F>
 where
     F: Future + Send + 'static,
+    F::Output: Send + 'static,
 {
     fn new(future: F) -> TaskFuture<F> {
         TaskFuture {
-            future: Box::pin(future),
-            poll: Poll::Pending,
+            state: TaskState::Pending(Box::new(future)),
         }
     }
 
@@ -38,8 +48,68 @@ where
         // check that the future is still pending before
         // calling `poll`. Failure to do so can lead to
         // a panic.
-        if self.poll.is_pending() {
-            self.poll = self.future.as_mut().poll(cx);
+        match self.state {
+            TaskState::Pending(ref mut future) => {
+                // Safety: &mut self is mutually exclusive,
+                // ergo we know that `self.future` is not
+                // moved or dropped in this function.
+                let pinned = unsafe { Pin::new_unchecked(future.as_mut()) };
+                let poll = pinned.poll(cx);
+                if poll.is_ready() {
+                    match poll {
+                        Poll::Ready(value) => {
+                            self.state = TaskState::Completed(value);
+                        }
+                        Poll::Pending => unreachable!(),
+                    }
+                }
+            }
+            TaskState::Completed(_) => {
+                println!("polled a completed task");
+            }
+            TaskState::Consumed => {
+                println!("polled a consumed task");
+            }
+        }
+    }
+
+    fn try_read_output(&mut self, dst: &mut Poll<JoinResult<F::Output>>, cx: &mut Context<'_>) {
+        match self.state {
+            TaskState::Pending(ref mut future) => {
+                // Safety: &mut self is mutually exclusive,
+                // ergo we know that `self.future` is not
+                // moved or dropped in this function.
+                let pinned = unsafe { Pin::new_unchecked(future.as_mut()) };
+                // This works nicely, because this function is only ever called when a Task is awaiting on
+                // a JoinHandle, which has a [`RawTask`] as a member and which calls `try_read_output` on
+                // that member.
+                //
+                // That means that here, we have the [`Context`] of the Task awaiting the JoinHandle, which
+                // we're now passing to the `poll` of a Future owned by another Task. Therefore from here on
+                // out, this Task awaiting the JoinHandle will have effectively taken ownership of that Future
+                // from the original Task. When that future signals it's ready, the JoinHandle's Task (the
+                // one that owns the `Context`) will be notified and the future will be polled again in this
+                // code path.
+                let poll = pinned.poll(cx);
+                match poll {
+                    Poll::Ready(res) => {
+                        *dst = Poll::Ready(Ok(res));
+                        self.state = TaskState::Consumed;
+                    }
+                    Poll::Pending => {
+                        *dst = Poll::Pending;
+                    }
+                }
+            }
+            TaskState::Completed(_) => match mem::replace(&mut self.state, TaskState::Consumed) {
+                TaskState::Completed(res) => {
+                    *dst = Poll::Ready(Ok(res));
+                }
+                TaskState::Consumed | TaskState::Pending(_) => unreachable!(),
+            },
+            TaskState::Consumed => {
+                panic!("polled a consumed task");
+            }
         }
     }
 }
@@ -77,15 +147,25 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    fn try_read_output(
+        self: &Arc<Self>,
+        dst: &mut Poll<JoinResult<F::Output>>,
+        cx: &mut Context<'_>,
+    ) {
+        let mut task_future = self.task_future.lock().unwrap();
+        task_future.try_read_output(dst, cx);
+    }
+
     fn into_raw(self: &Arc<Self>) -> RawTask {
         let raw = Arc::into_raw(self.clone());
         RawTask {
+            // Destroy generic type by casting to a raw pointer to the header.
             ptr: AtomicPtr::new(raw.cast::<Header>() as *mut Header),
         }
     }
 
-    fn from_raw(ptr: AtomicPtr<Header>) -> Arc<Task<F>> {
-        unsafe { Arc::from_raw(ptr.into_inner() as *const Task<F>) }
+    fn from_raw(ptr: &AtomicPtr<Header>) -> Arc<Task<F>> {
+        unsafe { Arc::from_raw(ptr.load(std::sync::atomic::Ordering::Relaxed) as *const Task<F>) }
     }
 
     fn schedule(self: &Arc<Self>) {
@@ -93,16 +173,13 @@ where
     }
 
     fn poll(self: Arc<Self>) {
+        let mut task_future = self.task_future.lock().unwrap();
+
         // Create a waker from the `Task` instance. This
         // uses the `ArcWake` impl from above.
         let waker = task::waker(self.clone());
-        let mut cx = Context::from_waker(&waker);
-
-        // No other thread ever tries to lock the task_future
-        let mut task_future = self.task_future.try_lock().unwrap();
-
-        // Poll the inner future
-        task_future.poll(&mut cx);
+        let cx = &mut Context::from_waker(&waker);
+        task_future.poll(cx)
     }
 
     // Spawns a new task with the given future.
@@ -123,9 +200,76 @@ where
     }
 }
 
-pub struct JoinHandle<T> {
-    _raw: RawTask,
-    _p: PhantomData<T>,
+pub struct JoinHandle<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    raw: RawTask,
+    _p: PhantomData<F>,
+}
+
+impl<F> Unpin for JoinHandle<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+}
+
+impl<F> JoinHandle<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn new(raw: RawTask) -> JoinHandle<F> {
+        JoinHandle {
+            raw,
+            _p: PhantomData::<F>,
+        }
+    }
+}
+
+/// We must explicitly drop the [`RawTask`] when the [`JoinHandle`] is dropped,
+/// because the [`RawTask`] is not dropped when the [`JoinHandle`] is dropped.
+impl<F> Drop for JoinHandle<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn drop(&mut self) {
+        unsafe {
+            self.raw.drop();
+        }
+    }
+}
+
+impl<F> Future for JoinHandle<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    type Output = JoinResult<F::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let mut ret = Poll::Pending;
+        // Try to read the task output. If the task is not yet complete, the
+        // cx is passed to the Future the task is waiting on, and thus it's waker
+        // is notified when the task is complete.
+        //
+        // The function must go via the vtable, which requires erasing generic
+        // types. To do this, the function "return" is placed on the stack
+        // **before** calling the function and is passed into the function using
+        // `*mut ()`.
+        //
+        // Safety:
+        //
+        // The type of `T` must match the task's output type.
+        unsafe {
+            self.raw = self.raw.try_read_output(&mut ret as *mut _ as *mut (), cx);
+        }
+
+        ret
+    }
 }
 
 #[derive(Clone)]
@@ -167,7 +311,7 @@ impl MiniTokio {
     ///
     /// The given future is wrapped with the `Task` harness and pushed into the
     /// `scheduled` queue. The future will be executed when `run` is called.
-    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
@@ -180,10 +324,7 @@ impl MiniTokio {
         // that can return a generic `JoinHandle<F::Output>`
         // while still being able to spawn a `Task<F>` that
         // can be polled by the `MiniTokio` instance.
-        JoinHandle {
-            _raw: raw,
-            _p: PhantomData,
-        }
+        JoinHandle::new(raw)
     }
 }
 
@@ -198,10 +339,30 @@ struct RawTask {
 }
 
 impl RawTask {
+    /// Safety: `dst` must be a `*mut Poll<super::Result<T::Output>>` where `T`
+    /// is the future stored by the task.
+    ///
+    /// Returns a must_use [`RawTask`] because this is only called by JoinHandle,
+    /// and we want JoinHandle to own the [`RawTask`] so that it can be dropped
+    /// when the [`JoinHandle`] is dropped.
+    #[must_use]
+    unsafe fn try_read_output(&self, dst: *mut (), cx: &mut Context<'_>) -> Self {
+        let vtable = self.header().vtable;
+        (vtable.try_read_output)(&self.ptr, dst, cx)
+    }
+
     fn poll(self) {
         let header = self.header();
         let vtable = header.vtable;
-        (vtable.poll)(self.ptr)
+        (vtable.poll)(&self.ptr)
+    }
+
+    fn as_task<F>(&self) -> Arc<Task<F>>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        Task::<F>::from_raw(&self.ptr)
     }
 
     /// Returns a reference to the task's header.
@@ -212,6 +373,12 @@ impl RawTask {
                 .as_ref()
                 .unwrap() // ptr should never be null
         }
+    }
+
+    unsafe fn drop(&mut self) {
+        let header = self.header();
+        let vtable = header.vtable;
+        (vtable.drop)(&self.ptr);
     }
 }
 
@@ -242,7 +409,11 @@ impl Header {
 #[derive(Debug)]
 struct Vtable {
     /// Polls the future.
-    poll: fn(AtomicPtr<Header>),
+    poll: fn(&AtomicPtr<Header>),
+    /// Reads the task output, if complete.
+    try_read_output: unsafe fn(&AtomicPtr<Header>, *mut (), &mut Context<'_>) -> RawTask,
+    /// Drops the task.
+    drop: unsafe fn(&AtomicPtr<Header>),
 }
 
 /// Wait, how is this allowed?! How can we return a static reference to a
@@ -257,12 +428,16 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    &Vtable { poll: poll::<F> }
+    &Vtable {
+        poll: poll::<F>,
+        try_read_output: try_read_output::<F>,
+        drop: drop::<F>,
+    }
 }
 
 /// Casts an [`AtomicPtr<Header>`] back into the `[Arc<Task<F>>]` it came from,
 /// and calls [`Task::poll`] on it.
-fn poll<F>(ptr: AtomicPtr<Header>)
+fn poll<F>(ptr: &AtomicPtr<Header>)
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
@@ -270,4 +445,32 @@ where
     // The pointer was created by `Arc::into_raw`, the task can (must) be re-created with `Arc::from_raw`.
     let task = Task::<F>::from_raw(ptr);
     task.poll();
+}
+
+#[derive(Debug)]
+pub struct JoinError(String);
+pub type JoinResult<T> = Result<T, JoinError>;
+
+unsafe fn try_read_output<F>(ptr: &AtomicPtr<Header>, dst: *mut (), cx: &mut Context<'_>) -> RawTask
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let out = &mut *(dst as *mut Poll<JoinResult<F::Output>>);
+    let task = Task::<F>::from_raw(ptr);
+    task.try_read_output(out, cx);
+    // Don't decrease the reference count on the task here,
+    // let JoinHandle manage that itself.
+    task.into_raw()
+}
+
+/// # Safety
+///
+/// - `ptr` must be a valid pointer to a [`Task`].
+unsafe fn drop<F>(ptr: &AtomicPtr<Header>)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let _task = Task::<F>::from_raw(ptr);
 }
