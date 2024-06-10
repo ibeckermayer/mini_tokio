@@ -15,6 +15,12 @@ pub struct MiniTokio {
     sender: channel::Sender<RawTask>,
 }
 
+// Constant block to assert Send and Sync
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<MiniTokio>();
+};
+
 impl MiniTokio {
     pub fn run(&self, num_threads: usize) {
         let mut workers = vec![];
@@ -40,6 +46,8 @@ impl MiniTokio {
     }
 
     pub fn new() -> MiniTokio {
+        // TODO: there ought to be some sort of bound on the number of tasks that can be
+        // scheduled at once.
         let (sender, scheduled) = channel::unbounded();
         MiniTokio { scheduled, sender }
     }
